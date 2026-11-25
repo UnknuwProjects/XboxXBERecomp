@@ -41,3 +41,10 @@ kept under its own license.
 
 The game-specific work lives in the port repository; this fork only carries
 the SDK-side changes.
+
+## Licensing
+
+This fork is distributed under the **GNU General Public License v3.0** — see
+[LICENSE](LICENSE). The upstream code it builds on remains under its original
+MIT license, kept in [LICENSE-MIT](LICENSE-MIT) (© TGP482); third-party
+components keep theirs (see `THIRD_PARTY.txt`).
