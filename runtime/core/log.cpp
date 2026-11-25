@@ -14,12 +14,22 @@ namespace fs = std::filesystem;
 
 namespace logx {
 
+// a diagnostic build (XBE_VERBOSE_LOG) keeps the player's single log file instead of
+// rotating per-run files, so the file they send is the one they always send
+#ifdef XBE_VERBOSE_LOG
+constexpr bool XBE_LOG_SINGLE_FILE = true;
+#else
+constexpr bool XBE_LOG_SINGLE_FILE = false;
+#endif
+
 static std::mutex g_mutex;
 static FILE* g_file = nullptr;
 static std::string g_path;
 static auto g_start = std::chrono::steady_clock::now();
 
 constexpr int kKeep = 30;
+constexpr size_t kMaxBytes = 8 * 1024 * 1024;  // per-file cap, rotated once (section 106)
+static size_t g_written = 0;
 
 // the run number of prefix_NNN.log, 0 for another name
 static int RunNumber(const fs::path& file, const std::string& prefix) {
@@ -33,9 +43,10 @@ void Init(const std::string& dir, const std::string& prefix, bool append) {
     std::lock_guard<std::mutex> lock(g_mutex);
     std::error_code ec;
     fs::create_directories(dir, ec);
-    if (!kVerbose) {
+    if (!kVerbose || XBE_LOG_SINGLE_FILE) {
         g_path = (fs::path(dir) / (prefix + ".log")).string();
         g_file = std::fopen(g_path.c_str(), append ? "a" : "w");
+        g_written = 0;
         return;
     }
     std::vector<std::pair<int, fs::path>> runs;
@@ -47,6 +58,7 @@ void Init(const std::string& dir, const std::string& prefix, bool append) {
     std::snprintf(name, sizeof(name), "%s_%03d.log", prefix.c_str(), runs.empty() ? 1 : runs.back().first + 1);
     g_path = (fs::path(dir) / name).string();
     g_file = std::fopen(g_path.c_str(), "w");
+    g_written = 0;
 }
 
 const std::string& Path() { return g_path; }
@@ -69,6 +81,21 @@ void Write(Level lv, const char* fmt, ...) {
     if (g_file) {
         std::fwrite(line, 1, size_t(n), g_file);
         if (lv >= Level::Warn) std::fflush(g_file);
+        // Cap the file (section 106): at 8 MB the current log rotates to
+        // <name>.old (replacing the previous one) and a fresh file starts,
+        // so a long session can never fill the storage - the folder holds
+        // at most the current log plus one rotation of it.
+        g_written += size_t(n);
+        if (g_written >= kMaxBytes) {
+            std::fclose(g_file);
+            const std::string old = g_path + ".old";
+            std::remove(old.c_str());
+            std::rename(g_path.c_str(), old.c_str());
+            g_file = std::fopen(g_path.c_str(), "w");
+            g_written = 0;
+            if (g_file)
+                std::fprintf(g_file, "[log rotated at 8 MB - the earlier part is in the .old file beside this one]\n");
+        }
     }
     std::fwrite(line, 1, size_t(n), stderr);
 }

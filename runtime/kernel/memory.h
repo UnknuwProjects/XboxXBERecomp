@@ -6,6 +6,7 @@ namespace mem {
 constexpr uint32_t kPage = 0x1000;
 constexpr uint32_t kUserLow = 0x00010000;
 constexpr uint32_t kUserHigh = 0x7FFE0000;
+constexpr uint32_t kMirrorBase = 0x08000000;      // the low RAM mirror: guest VA = kMirrorBase | physical
 constexpr uint32_t kContiguousBase = 0x80000000;  // guest VA = kContiguousBase | physical
 constexpr uint32_t kPhysicalSize = 64u << 20;
 constexpr uint32_t kWriteCombineBase = 0xF0000000;
@@ -22,6 +23,8 @@ constexpr uint32_t kMemCommit = 0x1000, kMemReserve = 0x2000, kMemDecommit = 0x4
 
 bool Init();
 uint8_t* Base();
+bool ReadSafe(uint32_t va, void* out, size_t n);  // a guest read that fails instead of faulting
+bool PageMapped(uint32_t va);                     // whether the host page behind a guest address is mapped
 bool Commit(uint32_t va, uint32_t size);
 void Decommit(uint32_t va, uint32_t size);
 bool IsCommitted(uint32_t va);

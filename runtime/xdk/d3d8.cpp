@@ -9,6 +9,12 @@
 #include <unordered_set>
 
 #include "app/app.h"
+#include "common/bridge.h"
+#include "netplay.h"
+#include "watchdog.h"
+#include "common/cheats.h"
+#include "common/menutouch.h"
+#include "common/mymusic.h"
 #include "core/diag.h"
 #include "gpu/backend.h"
 #include "gpu/texture.h"
@@ -162,6 +168,46 @@ uint32_t NewSurface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
 void SyncDeferred() {
     // deferred states live in the title's memory, the inline SetRenderState and SetTextureStageState write them
     for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++) g_state.rs[i] = R32(kRenderState + i * 4);
+    // section 155/157 audit: trace ONLY the point states (116..123).
+    // The first version traced 108..140 and its budget died at 7 s on
+    // texture-stage churn, long before any gameplay; these eight slots
+    // change rarely, so the trace now survives to the particle draws.
+    {
+        static uint32_t prev[8] = {};
+        static int budget = 400;
+        for (uint32_t i = 116; i < 124; i++) {
+            const uint32_t v = g_state.rs[i];
+            if (v != prev[i - 116] && budget > 0) {
+                float f;
+                std::memcpy(&f, &v, 4);
+                LOGI("d3d: rs %u %08X -> %08X (f %.3f)", i, prev[i - 116], v, f);
+                budget--;
+            }
+            prev[i - 116] = v;
+        }
+    }
+    // section 166 audit: the same treatment for the fog block (92..97 and
+    // the fog colour at 138). Fog is implemented in the backend and on by
+    // default in our options, yet no level has ever shown it - either the
+    // title never enables it in these levels, or it does and the values
+    // never reach the backend. Fog states change at level load at most,
+    // so a small budget still covers a whole session.
+    {
+        static uint32_t prev[7] = {};
+        static int budget = 200;
+        static constexpr uint32_t kFogStates[7] = {92, 93, 94, 95, 96, 97, 138};
+        for (int k = 0; k < 7; k++) {
+            const uint32_t i = kFogStates[k];
+            const uint32_t v = g_state.rs[i];
+            if (v != prev[k] && budget > 0) {
+                float f;
+                std::memcpy(&f, &v, 4);
+                LOGI("d3d: fog rs %u %08X -> %08X (f %.3f)", i, prev[k], v, f);
+                budget--;
+            }
+            prev[k] = v;
+        }
+    }
     for (int s = 0; s < 4; s++)
         for (uint32_t i = 0; i < gpu::kTssBumpEnvMat00; i++) g_state.tss[s][i] = R32(kTextureState + (s * kStageStates + i) * 4);
 }
@@ -488,6 +534,36 @@ std::atomic<uint32_t> g_presents{0};
 
 HLE_STDCALL(D3DDevice_Swap, 1) {
     app::SplashFirstFrame();
+    // the library's own pushbuffer (section 226): whatever its
+    // internal clients built this frame is drained before the
+    // present, the way the GPU would have taken it at the kick
+    d3d::DrainLibPushFrame();
+    // the port's per-frame music duck (LOCAL_PATCHES section 74): holds the game's own
+    // music volume at 0 while the player's My Music plays, through the game's own setter
+    game::MusicDuckFrame(ctx);
+    // the port's cheat panel (LOCAL_PATCHES section 83): applies its queued
+    // toggles to the game's own global cheat flags and mirrors their states
+    game::CheatsFrame(ctx);
+    // the bridge's deferred settings save (LOCAL_PATCHES section 92):
+    // PortSetSetting only marks the settings dirty; the save (file I/O +
+    // the JNI orientation push) runs here, outside script execution
+    PortBridgePumpSave();
+    // the in-game room screens (LOCAL_PATCHES section 140): keeps the
+    // room-name globals the QB room list reads in step with the relay
+    PortNetPump(ctx);
+    // 2P Online lockstep (LOCAL_PATCHES section 94): stamps the local
+    // input, latches the frame's input pair, checks sync checksums
+    netplay::FrameBoundary(ctx);
+    // menu touch phase 2 (LOCAL_PATCHES section 86): fires a recorded tap's
+    // focus / pad_choose events at the tapped element, through the game
+    menutouch::TapFrame(ctx);
+    // link-room auto-join (section 152): a room guest's Start arms it;
+    // it fires the first server row's choose event when the host's
+    // session appears in the stock server list
+    menutouch::AutoJoinFrame(ctx);
+    // frame watchdog (section 196): this thread presents; if it ever
+    // stops for five seconds the watchdog samples where it is parked
+    watchdog::Beat();
     // handed over from the previous instance: the window opens on the second frame, the first picture with
     // anything drawn over it right after
     if (app::HandingOver() && g_presents >= 2) {
@@ -1000,6 +1076,7 @@ namespace {
 uint32_t g_im_prim = 0, g_im_mask = 0;  // open primitive, slots it wrote
 float g_im_attr[64];                    // 16 slots of x y z w
 std::vector<float> g_im_vertices;       // every slot per vertex
+std::vector<uint32_t> g_im_inline;      // vertices sent as one inline array instead of per-slot writes
 
 // visibility tests: depth passing pixels are counted while enabled, a report gets the count since the clear,
 // at a physical address in the first 16 MB
@@ -1066,12 +1143,30 @@ void Walk(uint32_t end) {
             ApplyVisibilityMethod(m, v);
             if (m == 0x17FC) {  // begin/end, 0 ends
                 if (v) {
+                    LOG_FIRST(24, "d3d: walk begin prim %u", v);
                     g_im_prim = v;
                     g_im_mask = 0;
                     g_im_vertices.clear();
+                    g_im_inline.clear();
+                } else if (!g_im_inline.empty()) {
+                    // the primitive's vertices came as one inline array: whole vertices in the
+                    // bound format, drawn the way the push-buffer export draws them. Particle
+                    // systems submit this way - per-slot writes never happen for them, so
+                    // without this branch their primitive ended with no vertices at all.
+                    uint32_t stride = VertexBytes(), bytes = uint32_t(g_im_inline.size()) * 4;
+                    LOG_FIRST(16, "d3d: walk inline draw prim %u dwords %u stride %u", g_im_prim, uint32_t(g_im_inline.size()), stride);
+                    if (stride && bytes % stride == 0) DrawUp(g_im_prim, bytes / stride, g_im_inline.data(), stride);
+                    else LOG_FIRST(8, "d3d: Walk inline primitive %u dropped, %u bytes of vertices of %u", g_im_prim, bytes, stride);
+                    g_im_prim = 0;
+                    g_im_mask = 0;
+                    g_im_vertices.clear();
+                    g_im_inline.clear();
                 } else {
                     EndPrimitive();
                 }
+                continue;
+            } else if (m == 0x1818) {  // inline vertex array: raw dwords of whole vertices
+                if (g_im_prim) g_im_inline.push_back(v);
                 continue;
             } else if (m >= 0x1880 && m < 0x1900) {  // 2 floats, z = 0 and w = 1
                 a += (m - 0x1880) / 8 * 4;
@@ -1094,6 +1189,7 @@ void Walk(uint32_t end) {
                 last = m == 0x1524;
                 a[(m - 0x1518) / 4] = f;
             } else {
+                if (g_im_prim && m >= 0x1800 && m < 0x2100) LOG_FIRST(8, "d3d: walk drops method %04X head %08X inside prim %u", m, head, g_im_prim);
                 continue;
             }
             if (!g_im_prim) continue;
@@ -1103,7 +1199,151 @@ void Walk(uint32_t end) {
     }
     g_walk = end;
 }
+
+// the library's own pushbuffer, drained at its commit points: the same method
+// stream as the scratch buffer, except that state writes land in the simple
+// state (no export carries them for the library's internal clients) and a
+// primitive is assembled from per-slot writes or an inline array, whichever
+// the stream used. Used by the particle classes' draw, among others.
+void DrainPushImpl(uint32_t from, uint32_t to) {
+    LOG_FIRST(8, "d3d: lib push drain %08X..%08X (%u bytes)", from, to, to - from);
+    g_im_prim = 0;
+    g_im_mask = 0;
+    g_im_vertices.clear();
+    g_im_inline.clear();
+    for (uint32_t p = from; p + 4 <= to;) {
+        uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
+        p += 4;
+        if ((head & 0xA0030003) || n * 4 > to - p) {
+            LOG_FIRST(8, "d3d: lib push stops at command %08X, %u bytes before the end", head, to - p);
+            break;
+        }
+        for (uint32_t i = 0; i < n; i++, p += 4) {
+            uint32_t m = head & 0x40000000 ? method : method + i * 4, v = R32(p);
+            float f, *a = g_im_attr;
+            bool last = true;
+            std::memcpy(&f, &v, 4);
+            ApplyVisibilityMethod(m, v);
+            if (m == 0x17FC) {  // begin/end, 0 ends
+                if (v) {
+                    g_im_prim = v;
+                    g_im_mask = 0;
+                    g_im_vertices.clear();
+                    g_im_inline.clear();
+                } else if (!g_im_inline.empty()) {
+                    uint32_t stride = VertexBytes(), bytes = uint32_t(g_im_inline.size()) * 4;
+                    LOG_FIRST(16, "d3d: lib push inline draw prim %u dwords %u stride %u", g_im_prim, uint32_t(g_im_inline.size()), stride);
+                    if (stride && bytes % stride == 0) DrawUp(g_im_prim, bytes / stride, g_im_inline.data(), stride);
+                    else LOG_FIRST(8, "d3d: lib push inline primitive %u dropped, %u bytes of vertices of %u", g_im_prim, bytes, stride);
+                    g_im_prim = 0;
+                    g_im_mask = 0;
+                    g_im_vertices.clear();
+                    g_im_inline.clear();
+                } else {
+                    EndPrimitive();
+                }
+                continue;
+            }
+            if (m == 0x1818) {  // inline vertex array
+                if (g_im_prim) g_im_inline.push_back(v);
+                continue;
+            }
+            if (m >= 0x1880 && m < 0x1900) {  // 2 floats, z = 0 and w = 1
+                a += (m - 0x1880) / 8 * 4;
+                last = (m - 0x1880) / 4 & 1;
+                a[last] = f;
+                a[2] = 0;
+                a[3] = 1;
+            } else if (m >= 0x1940 && m < 0x1980) {  // 4 bytes
+                a += (m - 0x1940) / 4 * 4;
+                for (int c = 0; c < 4; c++) a[c] = (v >> c * 8 & 0xFF) / 255.0f;
+            } else if (m >= 0x1A00 && m < 0x1B00) {  // 4 floats
+                a += (m - 0x1A00) / 16 * 4;
+                last = ((m - 0x1A00) / 4 & 3) == 3;
+                a[(m - 0x1A00) / 4 & 3] = f;
+            } else if (m >= 0x1500 && m < 0x150C) {  // position, 3 floats and w = 1
+                last = m == 0x1508;
+                a[(m - 0x1500) / 4] = f;
+                a[3] = 1;
+            } else if (m >= 0x1518 && m < 0x1528) {  // position, 4 floats
+                last = m == 0x1524;
+                a[(m - 0x1518) / 4] = f;
+            } else {
+                if (m >> 2 < g_state.simple.size()) g_state.simple[m >> 2] = v;
+                continue;
+            }
+            if (!g_im_prim) continue;
+            g_im_mask |= 1u << (a - g_im_attr) / 4;
+            if (a == g_im_attr && last) g_im_vertices.insert(g_im_vertices.end(), g_im_attr, g_im_attr + 64);
+        }
+    }
+    g_im_prim = 0;
+    g_im_mask = 0;
+    g_im_vertices.clear();
+    g_im_inline.clear();
+}
 }  // namespace
+
+// the particle classes' packets have a rigid shape - begin,
+// a primitive, one inline vertex array, begin/end - and the
+// ordered parse above can lose its place in the library's
+// mixed stream before it reaches them (section 234). Scan
+// for the shape directly and draw what validates; a false
+// candidate costs four bytes of scanning.
+void ScanLibPackets(uint32_t from, uint32_t to) {
+    for (uint32_t p = from; p + 16 <= to;) {
+        if (R32(p) != 0x000417FC) { p += 4; continue; }
+        const uint32_t prim = R32(p + 4);
+        const uint32_t hdr = R32(p + 8);
+        const uint32_t n = (hdr >> 18) & 0x7FF;
+        if (prim != 8 || (hdr & 0x1FFC) != 0x1818 || !(hdr & 0x40000000) || n < 17) { p += 4; continue; }
+        const uint32_t end = p + 12 + n * 4;
+        if (end + 8 > to || R32(end) != 0x000417FC || R32(end + 4) != 0) { p += 4; continue; }
+        uint32_t stride = VertexBytes();
+        const uint32_t bytes = n * 4;
+        if (!stride || bytes % stride) stride = bytes % 16 == 0 ? 16 : 0;
+        LOG_FIRST(8, "d3d: lib packet prim %u dwords %u stride %u", prim, n, stride);
+        if (stride) DrawUp(prim, bytes / stride, g_base + p + 12, stride);
+        p = end + 8;
+    }
+}
+
+void DrainPush(uint32_t from, uint32_t to) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (to > from) {
+        DrainPushImpl(from, to);
+        ScanLibPackets(from, to);
+    }
+}
+
+// the library pushbuffer's segment (section 226): the base is the
+// lowest write pointer the allocator ever hands out, the end is
+// the device's own bound. The frame drain needs no commit and no
+// kick: at Swap time the write pointer still names the end of
+// everything the library built this frame.
+uint32_t g_lib_seg_base = 0, g_lib_seg_end = 0, g_lib_high = 0;
+
+void NotePushAlloc(uint32_t cur, uint32_t end) {
+    if (cur && (!g_lib_seg_base || cur < g_lib_seg_base)) g_lib_seg_base = cur;
+    if (end) g_lib_seg_end = end;
+    // the allocator's fit check reads the committed write
+    // pointer, so every allocation entry after a packet is
+    // written sees that packet's end - remember the peak
+    if (cur > g_lib_high) g_lib_high = cur;
+}
+
+void DrainLibPushFrame() {
+    if (!g_lib_seg_base || !g_lib_seg_end) return;
+    const uint32_t dev = R32(0x122E10);
+    if (!dev) return;
+    const uint32_t w = R32(dev);
+    // the pointer itself may already be reset by the time
+    // Swap runs; the frame's high-water mark still names
+    // the end of what was written, and the bytes are there
+    const uint32_t hi = w > g_lib_high ? w : g_lib_high;
+    if (hi > g_lib_seg_base && hi <= g_lib_seg_end) DrainPush(g_lib_seg_base, hi);
+    g_lib_high = g_lib_seg_base;
+}
 }  // namespace d3d
 
 HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {

@@ -13,6 +13,8 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #endif
 
 namespace mem {
@@ -22,9 +24,42 @@ static std::recursive_mutex g_lock;
 
 uint8_t* Base() { return g_base; }
 
-// physical memory shows at 0x80000000 and again at 0xF0000000 (write combined view)
+// a guest read that reports failure instead of faulting, so diagnostics
+// can poke at addresses a crash blames without becoming the crash
+bool ReadSafe(uint32_t va, void* out, size_t n) {
+    if (!g_base) return false;
+#ifdef _WIN32
+    std::memcpy(out, g_base + va, n);
+    return true;
+#else
+    iovec local{out, n};
+    iovec remote{reinterpret_cast<void*>(g_base + va), n};
+    return ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) == ssize_t(n);
+#endif
+}
+
+// whether the host page behind a guest address is mapped at all;
+// mincore answers without touching the page, so this cannot fault
+bool PageMapped(uint32_t va) {
+    if (!g_base) return false;
+#ifdef _WIN32
+    return true;
+#else
+    unsigned char vec = 0;
+    auto* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_base + (va & ~(kPage - 1))));
+    return ::mincore(page, kPage, &vec) == 0;
+#endif
+}
+
+// physical memory shows at 0x08000000 (the low mirror the memory
+// controller repeats every 64 MB), at 0x80000000 and again at
+// 0xF0000000 (write combined view). The low mirror matters: the
+// title stores list links in that form (a node at guest 0x088EEF90
+// is physical 0x008EEF90), and without the mapping every walk over
+// such a list faults on a pointer the hardware resolves fine.
 static bool InPhysical(uint32_t va) {
-    return (va >= kContiguousBase && va < kContiguousBase + kPhysicalSize) ||
+    return (va >= kMirrorBase && va < kMirrorBase + kPhysicalSize) ||
+           (va >= kContiguousBase && va < kContiguousBase + kPhysicalSize) ||
            (va >= kWriteCombineBase && va < kWriteCombineBase + kPhysicalSize);
 }
 
@@ -37,13 +72,15 @@ bool Init() {
         uint8_t* b = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), size, MEM_RESERVE, PAGE_NOACCESS));
         if (!b) continue;
         VirtualFree(b, 0, MEM_RELEASE);
-        // reserve around the two physical windows, then map the same memory into both
-        const uint64_t cuts[][2] = {{0, kContiguousBase},
+        // reserve around the physical windows, then map the same memory into all of them
+        const uint64_t cuts[][2] = {{0, kMirrorBase},
+                                    {kMirrorBase + kPhysicalSize, kContiguousBase},
                                     {kContiguousBase + kPhysicalSize, kWriteCombineBase},
                                     {kWriteCombineBase + kPhysicalSize, size}};
         bool ok = ram != nullptr;
         for (auto& c : cuts)
             ok = ok && VirtualAlloc(b + c[0], size_t(c[1] - c[0]), MEM_RESERVE, PAGE_NOACCESS) == b + c[0];
+        ok = ok && MapViewOfFileEx(ram, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, b + kMirrorBase) == b + kMirrorBase;
         ok = ok && MapViewOfFileEx(ram, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, b + kContiguousBase) == b + kContiguousBase;
         ok = ok && MapViewOfFileEx(ram, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, b + kWriteCombineBase) == b + kWriteCombineBase;
         if (ok) {
@@ -51,6 +88,7 @@ bool Init() {
             break;
         }
         for (auto& c : cuts) VirtualFree(b + c[0], 0, MEM_RELEASE);
+        UnmapViewOfFile(b + kMirrorBase);
         UnmapViewOfFile(b + kContiguousBase);
         UnmapViewOfFile(b + kWriteCombineBase);
     }
@@ -59,6 +97,7 @@ bool Init() {
     g_base = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
     int fd = g_base ? memfd_create("ram", 0) : -1;
     if (fd < 0 || ftruncate(fd, kPhysicalSize) ||
+        mmap(g_base + kMirrorBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED ||
         mmap(g_base + kContiguousBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED ||
         mmap(g_base + kWriteCombineBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
         g_base = nullptr;
@@ -68,44 +107,106 @@ bool Init() {
         return false;
     }
     LOGI("memory: guest space at %p", static_cast<void*>(g_base));
+#ifndef _WIN32
+    // section 169 diagnostic: prove the low mirror view works before any
+    // game code runs - write a pattern through the contiguous view and
+    // read it back through the mirror, without ever touching the mirror
+    // page directly. Three builds blamed this window for the binding
+    // crash; this line settles whether the mapping itself is sound.
+    {
+        const uint32_t off = 0x8EEF90, pat = 0xC0FFEE11;
+        *reinterpret_cast<volatile uint32_t*>(g_base + kContiguousBase + off) = pat;
+        uint32_t via_mirror = 0;
+        bool read = ReadSafe(kMirrorBase + off, &via_mirror, 4);
+        LOGI("memory: mirror self-test: page mapped %d, safe read %d, value %08X (want %08X)",
+             PageMapped(kMirrorBase + off) ? 1 : 0, read ? 1 : 0, via_mirror, pat);
+    }
+#endif
     return true;
 }
 
 // page commit map, one byte per 4 KB page
 static std::vector<uint8_t> g_committed(0x100000, 0);
 
+// The parts of [va, end) that lie outside every physical window. The
+// physical windows are mapped once at Init and stay mapped for the whole
+// session: the title's virtual reservations overlap them (its user space
+// contains the mirror window), and a commit or decommit whose range merely
+// STARTS outside a window but SPANS it must never touch the window's
+// pages. Section 164 mapped the low mirror and the binding crash survived
+// it, because a whole-reservation decommit starting below 0x08000000
+// still ran mprotect(PROT_NONE) and MADV_DONTNEED across the mirror -
+// the pages were mapped at boot and unmapped again by the first big
+// reservation the title released.
+static std::vector<std::pair<uint32_t, uint64_t>> OutsidePhysical(uint32_t va, uint64_t end) {
+    const uint64_t wins[3][2] = {{kMirrorBase, uint64_t(kMirrorBase) + kPhysicalSize},
+                                 {kContiguousBase, uint64_t(kContiguousBase) + kPhysicalSize},
+                                 {kWriteCombineBase, uint64_t(kWriteCombineBase) + kPhysicalSize}};
+    std::vector<std::pair<uint32_t, uint64_t>> out;
+    uint64_t cur = va;
+    for (auto& w : wins) {
+        if (cur < w[0]) out.push_back({uint32_t(cur), std::min(end, w[0])});
+        cur = std::max(cur, w[1]);
+        if (cur >= end) return out;
+    }
+    if (cur < end) out.push_back({uint32_t(cur), end});
+    return out;
+}
+
+static bool SpansPhysical(uint32_t va, uint64_t end) {
+    return uint64_t(va) < uint64_t(kMirrorBase) + kPhysicalSize && end > kMirrorBase ||
+           uint64_t(va) < uint64_t(kContiguousBase) + kPhysicalSize && end > kContiguousBase ||
+           uint64_t(va) < uint64_t(kWriteCombineBase) + kPhysicalSize && end > kWriteCombineBase;
+}
+
 bool Commit(uint32_t va, uint32_t size) {
-    if (!size || InPhysical(va)) return true;
+    if (!size) return true;
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    static int clip_log = 20;
+    if (SpansPhysical(first, end) && clip_log > 0) {
+        clip_log--;
+        LOGI("memory: commit %08X+%llX clipped around a physical window", first,
+             (unsigned long long)(end - first));
+    }
+    for (auto& [s, e] : OutsidePhysical(first, end)) {
 #ifdef _WIN32
-    if (!VirtualAlloc(g_base + first, size_t(end - first), MEM_COMMIT, PAGE_READWRITE)) {
-        LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
-        return false;
-    }
+        if (!VirtualAlloc(g_base + s, size_t(e - s), MEM_COMMIT, PAGE_READWRITE)) {
+            LOGE("memory: commit %08X+%llX failed", s, (unsigned long long)(e - s));
+            return false;
+        }
 #else
-    if (mprotect(g_base + first, size_t(end - first), PROT_READ | PROT_WRITE)) {
-        LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
-        return false;
-    }
+        if (mprotect(g_base + s, size_t(e - s), PROT_READ | PROT_WRITE)) {
+            LOGE("memory: commit %08X+%llX failed", s, (unsigned long long)(e - s));
+            return false;
+        }
 #endif
-    for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 1;
+        for (uint64_t p = s; p < e; p += kPage) g_committed[size_t(p >> 12)] = 1;
+    }
     return true;
 }
 
 void Decommit(uint32_t va, uint32_t size) {
-    if (InPhysical(va)) return;
+    if (!size) return;
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    static int clip_log = 20;
+    if (SpansPhysical(first, end) && clip_log > 0) {
+        clip_log--;
+        LOGI("memory: decommit %08X+%llX clipped around a physical window", first,
+             (unsigned long long)(end - first));
+    }
+    for (auto& [s, e] : OutsidePhysical(first, end)) {
 #ifdef _WIN32
-    VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT);
+        VirtualFree(g_base + s, size_t(e - s), MEM_DECOMMIT);
 #else
-    madvise(g_base + first, size_t(end - first), MADV_DONTNEED);
-    mprotect(g_base + first, size_t(end - first), PROT_NONE);
+        madvise(g_base + s, size_t(e - s), MADV_DONTNEED);
+        mprotect(g_base + s, size_t(e - s), PROT_NONE);
 #endif
-    for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 0;
+        for (uint64_t p = s; p < e; p += kPage) g_committed[size_t(p >> 12)] = 0;
+    }
 }
 
 bool IsCommitted(uint32_t va) { return InPhysical(va) || g_committed[va >> 12] != 0; }

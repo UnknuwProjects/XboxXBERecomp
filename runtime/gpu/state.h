@@ -174,6 +174,11 @@ struct State {
     std::shared_ptr<PixelShader> ps;
     std::array<std::array<float, 4>, 192> vsc{};  // hardware order: D3D register + 96
     std::array<std::array<float, 4>, 16> psc{};
+    // D3DDevice_SetVertexData*: what a vertex shader reads for an input no stream gives, diffuse white else 0,0,0,1
+    std::array<std::array<float, 4>, 16> vattr = {{{0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {1, 1, 1, 1},
+                                                   {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1},
+                                                   {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1},
+                                                   {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}}};
     Viewport viewport;
     Surface rt, zs;
     uint32_t scissor_count = 0;

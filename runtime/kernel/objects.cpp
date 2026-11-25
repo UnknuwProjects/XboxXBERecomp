@@ -187,14 +187,54 @@ int64_t ToDeadline(int64_t due) {
     return now + std::max<int64_t>(rel, 0) * 100;
 }
 
+static const char* ObjTypeName(ObjType t) {
+    switch (t) {
+        case ObjType::Event: return "event";
+        case ObjType::Semaphore: return "semaphore";
+        case ObjType::Mutant: return "mutant";
+        case ObjType::Timer: return "timer";
+        case ObjType::Thread: return "thread";
+        case ObjType::File: return "file";
+        case ObjType::SymLink: return "symlink";
+        case ObjType::Device: return "device";
+        case ObjType::Queue: return "queue";
+        default: return "other";
+    }
+}
+
 static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64_t timeout, bool alertable) {
     using namespace std::chrono;
     Thread* self = Current();
     uint32_t me = Me();
     bool infinite = timeout == INT64_MAX;
     int64_t deadline = infinite ? 0 : ToDeadline(timeout);
+    // a wait still blocked after three seconds says what it is
+    // waiting on, once (section 191): a guest thread parked here
+    // forever is a freeze with no other trace - a stock System
+    // Link menu died exactly that way, and the net layer's own
+    // waits (section 189) all proved innocent
+    const auto entered = steady_clock::now();
+    bool noted = false;
     std::unique_lock<std::mutex> lock(g_dispatch);
     for (;;) {
+        if (!noted && steady_clock::now() - entered > seconds(3)) {
+            noted = true;
+            std::string what;
+            for (const ObjectRef& o : objs) {
+                if (!what.empty()) what += ", ";
+                if (!o) {
+                    what += "null";
+                    continue;
+                }
+                what += ObjTypeName(o->type);
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "@%08X", o->guest);
+                what += buf;
+                if (!o->name.empty()) what += " '" + o->name + "'";
+            }
+            LOGI("kernel: wait blocked 3 s on %s (%s, %s)", what.c_str(), wait_all ? "all" : "any",
+                 infinite ? "no timeout" : "timed");
+        }
         if (wait_all) {
             bool all = std::all_of(objs.begin(), objs.end(), [&](const ObjectRef& o) { return o && Satisfied(*o, me); });
             if (all) {

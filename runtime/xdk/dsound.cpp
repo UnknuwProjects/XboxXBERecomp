@@ -775,6 +775,10 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
     v.headroom = DefaultHeadroom(flags);
     W32(a[1], obj);
+    // THPS4 diagnosis (BOOTSTRAP section 31): the music hunt needs the stream surface in
+    // the log - what format a stream is created with and whether packets ever flow
+    LOGI("dsound: stream %08X created, tag %X, %u ch, %u Hz, max %u packets", obj, v.tag, v.channels, v.rate,
+         v.max_packets);
     return 0;
 }
 
@@ -841,6 +845,7 @@ STREAM(GetStatus, 2) {
 STREAM(Process, 3) {
     uint32_t in = a[1];
     if (!in) return 0;
+    LOG_FIRST(48, "dsound: stream %08X fed a packet, %u queued", v.obj, uint32_t(v.packets.size()) + 1);
     Packet pk{R32(in), R32(in + 4), R32(in + 8), R32(in + 12), R32(in + 16)};
     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
@@ -866,10 +871,12 @@ STREAM(FlushEx, 4) {
 STREAM(Pause, 2) {
     v.paused = a[1] == 1;
     v.sync = a[1] == 2;
+    LOG_FIRST(16, "dsound: stream %08X pause %u", v.obj, a[1]);
     return 0;
 }
 STREAM(SetVolume, 2) {
     v.volume = Db(int32_t(a[1]));
+    LOG_FIRST(16, "dsound: stream %08X volume %d", v.obj, int32_t(a[1]));
     return 0;
 }
 STREAM(SetFrequency, 2) {

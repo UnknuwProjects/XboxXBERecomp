@@ -23,6 +23,7 @@ struct Settings {
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
+    std::string relay_addr;                // 2P Online relay server ("host" or "host:port", section 126)
 };
 
 Settings& Get();

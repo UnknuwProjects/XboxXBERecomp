@@ -33,6 +33,7 @@ struct PixelKey {
     uint32_t flat = 0, two_sided = 0;
     uint32_t proj = 0;       // fixed function: bit per stage sampled at coordinates divided by w
     uint32_t quad = 0;       // a screen quad: QuadHlsl
+    uint32_t pointsprite = 0;  // a point draw with point sprites on: stages sample the sprite square
     bool operator==(const PixelKey& o) const;
 };
 
@@ -100,6 +101,7 @@ struct DrawConstants {
     float amb[4];        // D3DRS_AMBIENT
     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
+    float vattr[16][4];  // State::vattr
 };
 
 }  // namespace gpu

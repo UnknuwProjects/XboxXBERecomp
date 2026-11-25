@@ -179,12 +179,17 @@ void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3
 std::vector<ThreadRef> Threads();
 
 // files
-void MountDefaults(const std::string& game_dir, const std::string& data_dir);
+void MountDefaults(const std::string& game_dir, const std::string& data_dir, uint32_t title_id);
 bool CreateSymbolicLink(const std::string& link, const std::string& target);
 bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
 std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle);  // host path or empty
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
+// serve a disc file from memory instead of from the image or a folder: the
+// host registers the replacement bytes for a disc-relative path (for example
+// "data\\pre\\qb.prx") and every open of that file reads them. Nothing is
+// written anywhere. Null clears the substitute. (THPS4 patch, LOCAL_PATCHES 53)
+void SetFileSubstitute(const std::string& disc_relative_path, std::shared_ptr<const std::vector<uint8_t>> bytes);
 
 // boot
 bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::string& game_dir, const std::string& data_dir);

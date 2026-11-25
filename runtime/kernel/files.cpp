@@ -1,14 +1,18 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <queue>
+#include <thread>
 
 #include "kernel/disc.h"
 #include "kernel/kernel.h"
 #include "kernel/exports.h"
+#include "common/mymusic.h"
 
 namespace fs = std::filesystem;
 
@@ -71,6 +75,7 @@ struct File : Object {
     std::string xbox;
     FILE* fp = nullptr;
     const Disc::Entry* entry = nullptr;  // on the disc image instead of a host path
+    std::shared_ptr<const std::vector<uint8_t>> mem;  // served from memory (SetFileSubstitute)
     bool dir = false;
     uint64_t pos = 0;
     std::vector<fs::directory_entry> entries;
@@ -190,7 +195,7 @@ std::string ReadCString(uint32_t va, size_t max) {
     return s;
 }
 
-void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
+void MountDefaults(const std::string& game_dir, const std::string& data_dir, uint32_t title_id) {
     std::lock_guard<std::mutex> lock(g_links_lock);
     fs::path d = data_dir;
     g_devices[kCdRom] = game_dir;
@@ -204,8 +209,28 @@ void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
         fs::create_directories(v, ec);
     }
     g_links["\\??\\D:"] = "\\Device\\CdRom0";
+    // THPS4 local patch (sdk/LOCAL_PATCHES.md): the console links the running title's own
+    // data folders as T: and U: when a title starts, and titles save through them. THPS4's
+    // save layer probes u:\ and, finding no drive, concludes there is no save device at
+    // all - it reports zero free blocks and refuses to save. Link them like the console.
+    char title_dir[16];
+    std::snprintf(title_dir, sizeof(title_dir), "%08X", title_id);
+    g_links["\\??\\T:"] = std::string("\\Device\\Harddisk0\\Partition1\\TDATA\\") + title_dir;
+    g_links["\\??\\U:"] = std::string("\\Device\\Harddisk0\\Partition1\\UDATA\\") + title_dir;
+    {
+        std::error_code ec;
+        fs::create_directories(d / "E" / "TDATA" / title_dir, ec);
+        fs::create_directories(d / "E" / "UDATA" / title_dir, ec);
+    }
     const Disc* disc = MountedDisc();
     LOGI("files: D: is %s, hard disk under %s", disc ? disc->Path().string().c_str() : game_dir.c_str(), data_dir.c_str());
+    // the patch folder's presence, so a log settles whether patched game data
+    // can be served at all (the section-45 route; see Resolve below)
+    {
+        std::error_code ec;
+        bool patch = fs::is_directory(fs::path(game_dir) / "patch", ec);
+        LOGI("files: patch folder %s", patch ? "present" : "absent");
+    }
 }
 
 bool CreateSymbolicLink(const std::string& link, const std::string& target) {
@@ -232,7 +257,25 @@ struct Target {
     std::string host;                    // empty on the disc image or unmapped
     bool disc = false;                   // on the mounted disc image
     const Disc::Entry* entry = nullptr;  // there: the file or folder, null when missing
+    std::shared_ptr<const std::vector<uint8_t>> mem;  // a registered memory substitute
 };
+
+// THPS4 local patch (sdk/LOCAL_PATCHES.md section 53): files the host serves
+// from memory, keyed by the upper-case disc-relative path. Registered before
+// the game starts; the game only ever reads them.
+std::map<std::string, std::shared_ptr<const std::vector<uint8_t>>> g_substitutes;
+std::mutex g_substitutes_lock;
+
+std::shared_ptr<const std::vector<uint8_t>> FindSubstitute(const std::vector<std::string>& parts) {
+    std::string key;
+    for (auto& part : parts) {
+        if (!key.empty()) key += '\\';
+        key += Upper(part);
+    }
+    std::lock_guard<std::mutex> lock(g_substitutes_lock);
+    auto it = g_substitutes.find(key);
+    return it == g_substitutes.end() ? nullptr : it->second;
+}
 
 Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
     std::string p = Normalize(xbox_path);
@@ -271,34 +314,59 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
     // no Xbox name holds ':', and fs::path would take "D:" as a host drive
     for (auto& part : parts)
         if (part.find(':') != std::string::npos) return {};
-    if (best->first == kCdRom)
+    if (best->first == kCdRom) {
+        // THPS4 local patch (sdk/LOCAL_PATCHES.md section 53): a file the host
+        // serves from memory wins over everything on the disc side - over the
+        // image, the extracted files and the patch folder alike - so a stale
+        // patch file can never shadow it.
+        if (auto sub = FindSubstitute(parts)) {
+            const Disc::Entry* e = nullptr;
+            if (const Disc* disc = MountedDisc()) e = disc->Find(parts);
+            LOG_FIRST(50, "files: %s served from memory (%zu bytes)", p.c_str(), sub->size());
+            return {{}, true, e, sub};
+        }
+        // THPS4 local patch (sdk/LOCAL_PATCHES.md): a patch folder beside the game
+        // mirrors the disc's layout and wins over both the image and the extracted
+        // files - modified game data (a translated qb.prx, say) reaches the game
+        // without touching the disc. Files only: a folder open still lists the
+        // disc's contents, never the patch folder's handful.
+        fs::path patched = MatchCase(best->second / "patch", parts);
+        std::error_code ec;
+        if (fs::exists(patched, ec) && !fs::is_directory(patched, ec)) {
+            LOG_FIRST(50, "files: patch %s", patched.string().c_str());
+            return {patched.string()};
+        }
         if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts)};
+    }
     return {MatchCase(best->second, parts).string()};
 }
 
 // the disc image is read only: nothing on it is created, replaced or written
 uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t handle_out, uint32_t iosb, uint32_t disposition,
-                    uint32_t options) {
-    if (!e && (disposition == 1 || disposition == 4)) {  // FILE_OPEN or FILE_OVERWRITE need an existing file
+                    uint32_t options, const std::shared_ptr<const std::vector<uint8_t>>& mem = nullptr) {
+    if (!e && !mem && (disposition == 1 || disposition == 4)) {  // FILE_OPEN or FILE_OVERWRITE need an existing file
         LOG_FIRST(200, "missing %s", name.c_str());
         IoStatus(iosb, kObjectNameNotFound, 5);
         return kObjectNameNotFound;
     }
-    if (!e || (disposition != 1 && disposition != 3)) {
+    if ((!e && !mem) || (disposition != 1 && disposition != 3)) {
         IoStatus(iosb, kAccessDenied, 0);
         return kAccessDenied;
     }
-    if (e->dir && !(options & 1) && (options & 0x40)) {  // options 1 FILE_DIRECTORY_FILE, 0x40 FILE_NON_DIRECTORY_FILE
+    if (e && e->dir && !(options & 1) && (options & 0x40)) {  // options 1 FILE_DIRECTORY_FILE, 0x40 FILE_NON_DIRECTORY_FILE
         IoStatus(iosb, kFileIsADirectory, 0);
         return kFileIsADirectory;
     }
     auto f = std::make_shared<File>();
     f->xbox = Normalize(name);
     f->entry = e;
-    f->dir = e->dir;
-    W32(handle_out, NewHandle(f));
+    f->mem = mem;
+    f->dir = e ? e->dir : false;
+    uint32_t nh = NewHandle(f);
+    W32(handle_out, nh);
     IoStatus(iosb, kSuccess, 1);
     LOG_FIRST(400, "open %s", name.c_str());
+    if (f->xbox.find("wma") != std::string::npos) LOG_FIRST(40, "wma open %s -> h=%x", name.c_str(), nh);  // TEMP
     return kSuccess;
 }
 
@@ -306,8 +374,22 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
 
 std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle) { return Resolve(xbox_path, root_handle).host; }
 
+void SetFileSubstitute(const std::string& disc_relative_path, std::shared_ptr<const std::vector<uint8_t>> bytes) {
+    std::string key = Upper(disc_relative_path);
+    std::replace(key.begin(), key.end(), '/', '\\');
+    std::lock_guard<std::mutex> lock(g_substitutes_lock);
+    if (bytes && !bytes->empty())
+        g_substitutes[key] = std::move(bytes);
+    else
+        g_substitutes.erase(key);
+}
+
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
     Target t = Resolve(xbox_path, 0);
+    if (t.mem) {
+        out = *t.mem;
+        return true;
+    }
     if (t.disc) {
         if (!t.entry || t.entry->dir) return false;
         out.resize(t.entry->size);
@@ -327,7 +409,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     uint32_t root;
     std::string name = ObjectName(attrs, &root);
     Target t = Resolve(name, root);
-    if (t.disc) return OpenOnDisc(t.entry, name, handle_out, iosb, disposition, options);
+    if (t.disc) return OpenOnDisc(t.entry, name, handle_out, iosb, disposition, options, t.mem);
     const std::string& host = t.host;
     if (host.empty()) {
         LOGW("NtCreateFile: no mapping for %s", name.c_str());
@@ -430,7 +512,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     uint32_t root;
     std::string name = ObjectName(attrs, &root);
     Target t = Resolve(name, root);
-    if (t.disc) return OpenOnDisc(t.entry, name, handle_out, iosb, 1, options);
+    if (t.disc) return OpenOnDisc(t.entry, name, handle_out, iosb, 1, options, t.mem);
     const std::string& host = t.host;
     std::error_code ec;
     if (host.empty() || !fs::exists(host, ec)) {
@@ -462,6 +544,47 @@ static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uin
     return status;
 }
 
+// Deferred completion for overlapped reads (THPS4 music fix, LOCAL_PATCHES §36).
+// On the console a read issued with a status block returns STATUS_PENDING and
+// completes later; THPS4's WMA streamer is built on exactly that: the issue
+// wrapper reports "pending" to the player, whose feeder then polls the status
+// block and accounts each finished chunk before issuing the next. A read that
+// completes inline instead makes the player set its read-done flag inside the
+// start call, the feeder never runs, the buffer cursor never advances and the
+// WMA media object is never created - no music, while every sound effect
+// (loaded through the waiting synchronous wrapper) plays fine. So a read with
+// a status block and no APC copies its data at issue time but posts the
+// completion from an I/O worker, like the real kernel. Callers that wait on
+// the file handle (the synchronous wrapper) wake from the same Finish().
+struct PendingIo {
+    std::shared_ptr<File> file;
+    uint32_t status, n, event, iosb;
+};
+static std::mutex g_io_lock;
+static std::condition_variable g_io_cv;
+static std::queue<PendingIo> g_io_queue;
+static void IoWorker() {
+    for (;;) {
+        PendingIo io;
+        {
+            std::unique_lock<std::mutex> lock(g_io_lock);
+            g_io_cv.wait(lock, [] { return !g_io_queue.empty(); });
+            io = std::move(g_io_queue.front());
+            g_io_queue.pop();
+        }
+        Finish(*io.file, io.status, io.n, io.event, 0, 0, io.iosb);
+    }
+}
+static void DeferIo(const std::shared_ptr<File>& file, uint32_t status, uint32_t n, uint32_t event, uint32_t iosb) {
+    static std::once_flag once;
+    std::call_once(once, [] { std::thread(IoWorker).detach(); });
+    {
+        std::lock_guard<std::mutex> lock(g_io_lock);
+        g_io_queue.push({file, status, n, event, iosb});
+    }
+    g_io_cv.notify_one();
+}
+
 static uint64_t Offset(File& f, uint32_t off) {
     int64_t o = off ? int64_t(R64(off)) : -1;
     return o >= 0 ? uint64_t(o) : f.pos;
@@ -471,8 +594,8 @@ static uint64_t Offset(File& f, uint32_t off) {
 static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], buf = a[5], len = a[6], off = a[7];
     auto f = FileFromHandle(h);
-    if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
-    if (write && f->entry) return kAccessDenied;
+    if (!f || (!f->fp && !f->entry && !f->mem)) return kInvalidHandle;
+    if (write && (f->entry || f->mem)) return kAccessDenied;
     ResetEvent(*f);
     std::lock_guard<std::mutex> lock(f->io);
     uint64_t pos = Offset(*f, off);
@@ -481,16 +604,45 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     while (n < len) {
         uint32_t at = pages ? R32(pages + n / 0x1000 * 8) + n % 0x1000 : buf + n;
         uint32_t chunk = pages ? std::min(len - n, 0x1000 - n % 0x1000) : len;
-        size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
-                      : write  ? std::fwrite(HostPtr(at), 1, chunk, f->fp)
-                               : std::fread(HostPtr(at), 1, chunk, f->fp);
+        size_t done = 0;
+        if (f->mem) {  // a memory substitute: plain bytes, clamped at the end
+            uint64_t at_pos = pos + n;
+            if (at_pos < f->mem->size()) {
+                done = std::min<uint64_t>(chunk, f->mem->size() - at_pos);
+                std::memcpy(HostPtr(at), f->mem->data() + at_pos, done);
+            }
+        } else if (f->entry) {
+            done = MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk);
+        } else if (write) {
+            done = std::fwrite(HostPtr(at), 1, chunk, f->fp);
+        } else {
+            done = std::fread(HostPtr(at), 1, chunk, f->fp);
+        }
         n += uint32_t(done);
         if (done < chunk) break;
     }
     f->pos = pos + n;
-    if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
-    if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
-    return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
+    uint32_t status = kSuccess;
+    if (write && n < len) status = 0xC000007F;  // disk full
+    if (!write && len && !n) status = kEndOfFile;
+    // TEMP (music hunt): log what the WMA reads ask and what they get.
+    if (f->xbox.find("wma") != std::string::npos)
+        LOG_FIRST(240, "ntread: %s h=%x iosb=%x len=%u off=%lld -> %08X n=%u", f->xbox.c_str(), h, iosb, len,
+                  (long long)pos, status, n);
+    // the game soundtrack's now-playing (section 196): the panel
+    // names the song whose archive range is being streamed
+    if (!write && f->xbox.find("music_wma.wad") != std::string::npos)
+        mymusic::NoteGameWadRead(uint32_t(pos));
+    // Overlapped-style read: the data is already in the guest buffer, but the
+    // completion is posted by the I/O worker and the call returns STATUS_PENDING
+    // (see DeferIo above). Scatter/gather, writes, APC reads and calls without a
+    // status block keep the synchronous behaviour they have always had.
+    if (!write && !pages && iosb && !apc) {
+        IoStatus(iosb, kPending, 0);
+        DeferIo(f, status, n, event, iosb);
+        return kPending;
+    }
+    return Finish(*f, status, n, event, apc, apc_ctx, iosb);
 }
 
 KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, 0); }
@@ -504,7 +656,7 @@ KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
     auto f = FileFromHandle(h);
     if (!f) return kInvalidHandle;
     std::error_code ec;
-    uint64_t size = f->dir ? 0 : f->entry ? f->entry->size : fs::file_size(f->host, ec);
+    uint64_t size = f->dir ? 0 : f->mem ? f->mem->size() : f->entry ? f->entry->size : fs::file_size(f->host, ec);
     if (f->fp) {
         std::fflush(f->fp);
         size = fs::file_size(f->host, ec);
@@ -512,7 +664,7 @@ KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
     std::memset(HostPtr(out), 0, len);
     switch (cls) {
         case 4: {  // FileBasicInformation
-            uint64_t t = f->entry ? MountedDisc()->Time() : ToFileTime(fs::last_write_time(f->host, ec));
+            uint64_t t = (f->entry || f->mem) ? MountedDisc()->Time() : ToFileTime(fs::last_write_time(f->host, ec));
             for (int i = 0; i < 4; i++) W64(out + i * 8, t);
             W32(out + 0x20, f->dir ? 0x10 : 0x80);
             IoStatus(iosb, kSuccess, 0x28);
@@ -530,7 +682,8 @@ KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
             IoStatus(iosb, kSuccess, 8);
             return kSuccess;
         case 34:  // FileNetworkOpenInformation
-            if (f->entry) FillNetworkInfo(out, *f->entry);
+            if (f->mem) FillNetworkInfo(out, MountedDisc()->Time(), f->mem->size(), false);
+            else if (f->entry) FillNetworkInfo(out, *f->entry);
             else FillNetworkInfo(out, f->host);
             IoStatus(iosb, kSuccess, 0x38);
             return kSuccess;
@@ -548,7 +701,7 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
     uint32_t h = a[0], iosb = a[1], in = a[2], cls = a[4];
     auto f = FileFromHandle(h);
     if (!f) return kInvalidHandle;
-    if (f->entry && cls != 14 && cls != 4) return kAccessDenied;
+    if ((f->entry || f->mem) && cls != 14 && cls != 4) return kAccessDenied;
     std::error_code ec;
     switch (cls) {
         case 14:  // position
@@ -676,11 +829,12 @@ KERNEL_EXPORT(210, NtQueryFullAttributesFile, 2) {
     std::string name = ReadAnsiString(R32(a[0] + 4));
     Target t = Resolve(name, R32(a[0]));
     std::error_code ec;
-    if (t.disc ? !t.entry : t.host.empty() || !fs::exists(t.host, ec)) {
+    if (t.disc ? (!t.entry && !t.mem) : t.host.empty() || !fs::exists(t.host, ec)) {
         LOG_FIRST(200, "missing %s", name.c_str());
         return kObjectNameNotFound;
     }
-    if (t.disc) FillNetworkInfo(a[1], *t.entry);
+    if (t.mem) FillNetworkInfo(a[1], MountedDisc()->Time(), t.mem->size(), false);
+    else if (t.disc) FillNetworkInfo(a[1], *t.entry);
     else FillNetworkInfo(a[1], t.host);
     return kSuccess;
 }

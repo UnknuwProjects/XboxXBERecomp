@@ -54,6 +54,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 amb;
     float4 lt[56];
     float4 rtshift;
+    float4 vattr[16];
 };
 )";
 
@@ -132,7 +133,7 @@ std::string Src(const Tok& k, int which, uint16_t regs) {
         base = reg == 12 ? "oPos" : F("R%u", reg);
     } else if (mux == 2) {
         uint32_t v = k.f(1, 9, 4);
-        base = (regs >> v) & 1 ? F("i.v%u", v) : (v == 3 ? "float4(1,1,1,1)" : "float4(0,0,0,1)");
+        base = (regs >> v) & 1 ? F("i.v%u", v) : F("vattr[%u]", v);
     } else {
         uint32_t cr = k.f(1, 13, 8);
         base = k.f(3, 1, 1) ? F("c[clamp(a0 + %u, 0, 191)]", cr) : F("c[%u]", cr);
@@ -833,6 +834,26 @@ std::string PixelHlsl(const PixelKey& k) {
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
     s += "    if (misc.w == 0) v1 = float4(0, 0, 0, 1);\n";
     s += "    float4 fogin = float4(fogcolor.rgb, saturate(i.fogamt));\n";
+    if (k.pointsprite) {
+        // point sprites: every stage samples the point's own square, not
+        // the vertex texcoords. gl_PointCoord cannot be reached from
+        // HLSL through glslang, so the position inside the point is
+        // rebuilt from the fragment coordinate: the points vertex
+        // wrapper parked the point's centre (NDC) and its size (guest
+        // pixels) in tc0, and ext.w carries the target's host-per-guest
+        // pixel scale. The maths, in full: the fragment's offset from
+        // the centre is (spfc - tc0.xy) of NDC, the target spans 2 NDC
+        // over spvp host pixels, so the offset in host pixels is that
+        // difference times spvp / 2; the point's size in host pixels
+        // is tc0.z times ext.w. Section 147's first version divided by
+        // the guest size alone, which overshot the sprite square by
+        // 2 * ext.w (about sixfold at 1080p) and sampled the texture's
+        // transparent edge everywhere - the fountain stayed invisible.
+        s += "    float2 spvp = surf.xy * max(ext.w, 1e-6);\n";
+        s += "    float2 spfc = float2(i.pos.x / spvp.x * 2 - 1, 1 - i.pos.y / spvp.y * 2);\n";
+        s += "    float2 spr = float2(spfc.x - tc0.x, -(spfc.y - tc0.y)) * spvp / (2.0 * max(tc0.z, 1e-6) * max(ext.w, 1e-6)) + 0.5;\n";
+        s += "    tc0 = float4(spr, 0, 1); tc1 = float4(spr, 0, 1); tc2 = float4(spr, 0, 1); tc3 = float4(spr, 0, 1);\n";
+    }
     std::string body;
     if (k.programmable) {
         for (int i = 0; i < 4; i++) {
