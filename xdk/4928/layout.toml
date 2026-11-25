@@ -1,0 +1,57 @@
+# XDK 4928 library data layouts the runtime reads or writes. Every CDevice value below is proven by
+# Tony Hawk's Pro Skater 4 (title 0x41560017, XDK 4928) code at the address given, the same standard
+# the 4831/5849 files hold themselves to. Result: the 4928 CDevice is the 4831-generation layout -
+# every proven field matches 4831 exactly (5849 reorganised the struct; none of its offsets apply).
+# The device is a static struct at 0x1235D0; D3D__pDevice (data 0x122E10) points at it.
+# Fields marked CARRIED are the only ones not directly observed in THPS4 code; each says why.
+[layout]
+# D3D8 CDevice, the static device D3D__pDevice points at; its miniport is embedded at +0x23C0
+# (D3DDevice_SetGammaRamp 0x1181E3 forms lea edx, [dev + 0x23C0] and works through it)
+CDevice_Push              = 0x0    # D3D_SetFence 0x119A37 reads it, compares with +4, calls MakeSpace when full; the same head pattern opens SetTexture/SetViewport/SetPalette
+CDevice_PushThreshold     = 0x4    # D3D_SetFence 0x119A39 compares the push pointer with it
+CDevice_BaseVertex        = 0x1C   # D3DDevice_DrawIndexedVertices 0x1141B0 reads [dev + 0x1C] as the base vertex (see BOOTSTRAP section 16)
+CDevice_IndexBuffer       = 0x38C  # CARRIED from 4831: never accessed anywhere in this XBE - D3DDevice_SetIndices is not linked (BOOTSTRAP section 16), so the runtime's SetIndices path is never exercised by this title
+CDevice_ZScale            = 0x510  # the viewport helper 0x114730 multiplies (MaxZ - MinZ) by [dev + 0x510] at 0x1147A6 and MinZ by it at 0x1147B0
+CDevice_SuperSampleX      = 0x518  # the viewport helper 0x114730 multiplies the viewport Width by [dev + 0x518] at 0x114756
+CDevice_SuperSampleY      = 0x51C  # the viewport helper 0x114730 multiplies the viewport Height by [dev + 0x51C] at 0x11477C
+CDevice_Transforms        = 0x810  # D3DDevice_SetTransform 0x118276 copies 16 dwords to +0x810 + type * 64; D3DDevice_GetTransform 0x118382 copies back out
+CDevice_Textures          = 0xB38  # D3DDevice_SetTexture 0x1189A0 reads, 0x1189D9 stores [dev + stage * 4 + 0xB38]
+CDevice_Palettes          = 0xB48  # D3DDevice_SetPalette 0x118B4D reads, 0x118B85 stores [dev + stage * 4 + 0xB48]
+CDevice_RenderTarget      = 0x21B4 # D3DDevice_GetRenderTarget2 0x118526 returns [dev + 0x21B4] (AddRef via 0x116150)
+CDevice_Depth             = 0x21B8 # D3DDevice_GetDepthStencilSurface2 0x118546 returns [dev + 0x21B8]
+CDevice_BackBuffer        = 0x21C0 # D3DDevice_GetBackBuffer2 0x1184E5 returns [dev + index * 4 + 0x21C0] for index 0
+CDevice_FrontBuffer       = 0x21C4 # D3DDevice_GetBackBuffer2 returns [dev + 0x21C4] for index -1; the present helper 0x116489 flips from it
+CDevice_SwapCount         = 0x2C10 # D3DDevice_Swap 0x116DF0 increments [dev + 0x2C10], 0x116DD3 reads it to index the back-buffer array at +0x2124
+CDevice_Size              = 0x2C30 # Direct3D_CreateDevice 0x1190BB clears 0xB0C dwords (0x2C30 bytes) of the device on failure
+CDevice_Flags             = 0x8    # Direct3D_CreateDevice 0x119076 ors BehaviorFlags & 0x10 into [device + 8] (static device base 0x1235D0, flags slot 0x1235D8); D3DDevice_SetPixelShader 0x119221 tests that bit
+CDevice_Time              = 0x30   # D3D_SetFence 0x119A4D pushes [dev + 0x30] as the fence value, 0x119AC9 adds 2 and stores it back; SetTexture/SetPalette/SetStreamSource stamp resources with it at [res + 8]
+CDevice_PixelShader       = 0x370  # D3DDevice_SetPixelShader 0x119148 reads the old handle, 0x119158 stores the new one at [dev + 0x370]
+CDevice_VertexShader      = 0x380  # D3DDevice_SetVertexShader 0x117F91 reads the old object, 0x117FE8 stores the new one at [dev + 0x380] (handle at +0x384)
+CDevice_BackBufferScale   = 0x528  # the frame buffer init stores the X scale as a float at [dev + 0x528] (0x11E4AA), the Y scale at +0x52C (0x11E4C3)
+CDevice_Viewport          = 0xA90  # D3DDevice_SetViewport 0x11865B to 0x11867F stores X, Y, Width, Height, MinZ, MaxZ at +0xA90..+0xAA4
+CDevice_ScreenSpaceOffset = 0xAA8  # D3DDevice_SetScreenSpaceOffset 0x118E83 stores x + 0.53125 at [dev + 0xAA8], 0x118E93 y + 0.53125 at +0xAAC
+CDevice_AutoDepth         = 0x21CC # the render-target setter core 0x11E36C reads the old auto depth surface at [dev + 0x21CC], releases it via 0x116190, 0x11E37D stores the new one
+CDevice_VBlankCallback    = 0x2550 # the one-argument setter 0x1183B0 stores the callback pointer at [dev + 0x2550] (its sibling setter 0x1183D0 stores an unnamed field at +0x254C)
+CDevice_VBlankEvent       = 0x2554 # D3DDevice_BlockUntilVerticalBlank 0x118407 passes dev + 0x2554 to KeWaitForSingleObject and 0x1183FB clears its SignalState at +0x2558 (event header + 4)
+CDevice_DisplayFlags      = 0x2574 # the present helper tests [dev + 0x2574] bit 0x1000000 at 0x11647B and 0x1164BB to pick the flip path
+CDevice_VBlankCount       = 0x2580 # the present helper reads [dev + 0x2580] at 0x1164F7, increments it at 0x11650A and stores it back at 0x11650B
+CDevice_Field             = 0x2590 # CARRIED from 4831 (miniport + 0x1D0): the vertical blank handler that writes it is not identified in this XBE yet; every neighbouring field (+0x2574, +0x2580, +0x259C) is proven at the 4831 offset
+CDevice_GammaRamps        = 0x259C # D3DDevice_SetGammaRamp 0x118200/0x118213 addresses ramp slots at miniport + 0x1DC + index * 0x300 = dev + 0x259C
+CDevice_GammaPending      = 0x2B9C # D3DDevice_SetGammaRamp 0x118241 sets [miniport + 0x7DC + index * 4] = dev + 0x2B9C (the +0x2BA4 field it also writes is the current-ramp index, not the pending flags)
+# D3D8 globals
+DirtyFlags_Texture        = 0x4800 # D3DDevice_SetTexture 0x118A17 ors 0x4800 into D3D__DirtyFlags; D3DDevice_SetPixelShader 0x119166 does the same
+TextureState_Stage        = 32     # D3DDevice_SetTextureStageStateNotInline 0x11504B shifts the stage by 5 and stores at [0x122E20 + (stage * 32 + type) * 4]
+Stream_Size               = 12     # D3DDevice_SetStreamSource 0x117BAA indexes the stream record table (global 0x1232C0) by stream * 12
+Stream_Stride             = 0x0    # D3DDevice_SetStreamSource 0x117BE0 reads, 0x117BF2 stores the stride at record + 0
+Stream_Buffer             = 0x8    # D3DDevice_SetStreamSource 0x117BF8 stores the vertex buffer at record + 8
+PixelShader_Definition    = 0x8    # D3DDevice_SetPixelShader 0x1191C0 reads the definition pointer at [shader + 8] and dereferences its fields (+0x20, +0x24, +0xD8, +0xEC)
+# DSOUND
+CDirectSoundStream_Vtable  = 0x0   # CARRIED structural offset (primary vtable at +0 in every XDK build); THPS4's stream vtables were located in .rdata at 0x1A368C (primary) and 0x1A3680 (second) - BOOTSTRAP section 6
+CDirectSoundStream_Vtable2 = 0x4   # CARRIED structural offset (second interface vtable at +4 in every XDK build); see above
+EffectsImage_Skip0         = 0x804 # the effects image parser 0x142353 adds [image + 0x804]
+EffectsImage_Skip1         = 0x80C # the effects image parser 0x14234D loads [image + 0x80C]
+EffectsImage_Desc          = 0x818 # the effects image parser 0x14235C: descriptor at image + 0x818 + (Skip0 + Skip1) * 4
+# XAPI XPP device type record
+XPP_Current               = 0x0    # CARRIED from 4831/5849 (identical in both): head of each XPP device type record; THPS4's gamepad record is XPP_GamepadType at 0x186E90, passed to the XPP open routine by .text callers at 0xF58D5/0xF5B96
+XPP_Changed               = 0x4    # CARRIED, see XPP_Current
+XPP_Previous              = 0x8    # CARRIED, see XPP_Current
